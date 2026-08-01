@@ -1,34 +1,53 @@
-"""Local paths for the cluster (analogous to care-training's care_config.py).
+"""Local paths for the cluster — complete config for CARE dataset_pase.py.
 
-Copy this file into:
-    /home/ouo/care_training/CARE/pretraining/config.py
+Overwrites /home/ouo/care_training/CARE/pretraining/config.py.
 
-Or apply via patches/apply_hubert_large_patches.sh.
+Includes ALL variables that dataset_pase.py imports (even those the CARE
+codebase leaves unused / dead after patching). Only the semantic target
+(podcast_roberta_feats*) is redirected to our new Llama mean-pool features;
+everything else matches the care-training baseline paths.
 """
 
-# ---- MSP-PODCAST audio (unchanged from care-training baseline) ----
-podcast_audio_dir = "/home/ouo/dataset/MSP_Podcast/Audios"
+# ---- MSP-PODCAST audio + splits (unchanged from care-training baseline) ----
+podcast_audio_folder = "/home/ouo/dataset/MSP_Podcast/Audios"
+train_files          = "/home/ouo/care_training/data/train_files.json"
+valid_files          = "/home/ouo/care_training/data/valid_files.json"
+
+# ---- Whisper transcripts (unchanged) ----
+podcast_transcripts  = "/home/ouo/care_training/data/whisper_transcripts.json"
 
 # ---- Acoustic supervision target: PASE+ 256-d @ 100Hz (unchanged) ----
 podcast_pase_feats      = "/home/ouo/care_training/data/pase_features"
-podcast_opensmile_feats = "/home/ouo/care_training/data/pase_features"  # alias, unused
+podcast_opensmile_feats = "/home/ouo/care_training/data/pase_features"   # alias, dead in our runs
 
 # ---- Semantic supervision target: Llama-3.1-8B mean-pool (NEW, 4096-d) ----
 # Produced by scripts/extract_msppodcast_llama_mean.py in this repo.
-# For care-training-large only — the baseline care-training uses RoBERTa
-# features at a different path.
 podcast_llama_feats     = "/home/ouo/care_training_large/data/llama_features"
 
-# ---- Aliases so the modified train script can read either target ----
-podcast_roberta_feats                = podcast_llama_feats  # semantic target
+# All roberta_* aliases point to the new Llama features so CARE's dataset
+# (which reads only these keys) drops in the Llama target unchanged.
+podcast_roberta_feats                = podcast_llama_feats
 podcast_roberta_feats_whisper        = podcast_llama_feats
 podcast_roberta_feats_whisper_sup    = podcast_llama_feats
-podcast_roberta_logits               = "/home/ouo/care_training_large/data/roberta_logits_PLACEHOLDER"
 podcast_roberta_feats_large          = podcast_llama_feats
 podcast_roberta_feats_paraphrasings  = podcast_llama_feats
 podcast_roberta_feats_all            = podcast_llama_feats
 podcast_roberta_feats_supervised     = podcast_llama_feats
+podcast_roberta_logits               = "/home/ouo/care_training_large/data/roberta_logits_PLACEHOLDER"
 
-# ---- Whisper transcripts (unchanged; not directly used at train time,
-#      only during Llama mean-pool extraction) ----
-podcast_transcripts     = "/home/ouo/care_training/data/whisper_transcripts"
+# ---- WavLM tokens / features (dead code post-patch; kept for import compat) ----
+# dataset_pase.py imports these but the code path is skipped in the baseline
+# care-training patches. Values just need to exist so the `from config import ...`
+# succeeds; content is never actually loaded.
+podcast_wavlm_tokens    = "/home/ouo/care_training/data/wavlm_tokens.txt"
+podcast_wavlm_feats     = "/home/ouo/care_training/data/wavlm_features_PLACEHOLDER"
+podcast_wavlm_feats_6   = "/home/ouo/care_training/data/wavlm_features_6_PLACEHOLDER"
+podcast_wavlm_tokens_6  = "/home/ouo/care_training/data/wavlm_tokens_6_PLACEHOLDER"
+
+# ---- Quantized energy / pitch (dead code, --energy_weights/--pitch_weights False) ----
+quantized_energy_folder = "/home/ouo/care_training/data/energy_PLACEHOLDER"
+quantized_pitch_folder  = "/home/ouo/care_training/data/pitch_PLACEHOLDER"
+
+# ---- Labels (dead in unsupervised mode; needed for --supervised True) ----
+podcast_labels          = "/home/ouo/care_training/data/labels_PLACEHOLDER"
+podcast_text_labels     = "/home/ouo/care_training/data/text_labels_PLACEHOLDER"
