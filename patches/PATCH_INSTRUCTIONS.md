@@ -83,6 +83,42 @@ changes, not the optimization.
 - semantic encoder = RoBERTa-large, chosen so the width match (and therefore
   the adapter-free boundary) survives the backbone swap
 
+## Checkpoints
+
+Files written to `<checkpoint_dir>`:
+
+| File | Contents | Retention |
+|---|---|---|
+| `best.pth` | model state_dict + config, lowest validation loss | always kept — **this is the one downstream uses** |
+| `final.pth` | model state_dict + config at 200K updates | always kept |
+| `model-<update>.pth` | model state_dict + config, every 10K updates | newest `--keep_last` (default 3) |
+| `last.pth` | model + both optimizers + counters + RNG state | rolling, overwritten each eval |
+
+Checkpoints are **state_dicts, not pickled modules**. Load them with the helper,
+which rebuilds the architecture from the config stored alongside the weights:
+
+```python
+from model_pase_hubert_large import load_pretrained
+model = load_pretrained("ckpts_hubert_large/best.pth", device="cuda")
+fusion_out, pooled_audio, fusion_out_aud = model.extract_audio_features(wavs)
+```
+
+Any `torch.load(path)` in the downstream extractor that expected a whole module
+must be switched to this.
+
+To resume after a preemption or crash:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python train_pase_hubert_large.py \
+    /home/ouo/care_training_large/ckpts_hubert_large \
+    --batch_size 32 --resume auto
+```
+
+`--resume auto` is a no-op when `last.pth` does not exist, so it is safe to put
+in the launch script from the start. The shuffled batch order inside the
+interrupted epoch is not replayed, so a resumed run is not bit-identical to an
+unbroken one.
+
 ## Downstream layer stack changed — update the SUPERB config
 
 The paper aggregates **13 layers × T × 1536**: 6 pairs of (semantic ‖ acoustic)

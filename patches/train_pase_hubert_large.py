@@ -37,6 +37,7 @@ Usage (Blackwell 6000, 102 GB):
         --pool_fn avg
 """
 import os
+import re
 import argparse
 import logging
 import random
@@ -115,6 +116,13 @@ parser.add_argument("--keep_text_model", action="store_true",
                     help="Keep CARE's unused text-side tower. Off by default: "
                          "this trainer never runs it and it adds ~150M frozen "
                          "params to every pickled checkpoint.")
+parser.add_argument("--keep_last",     default=3, type=int,
+                    help="How many periodic model-<update>.pth files to retain. "
+                         "best.pth, final.pth and last.pth are never pruned. "
+                         "0 keeps every periodic checkpoint.")
+parser.add_argument("--resume",        default=None, type=str,
+                    help='Path to a last.pth to resume from, or "auto" to pick '
+                         'up <checkpoint_dir>/last.pth if it exists.')
 parser.add_argument("--wandb",         default="True", type=str,
                     help='"True" to enable WandB; "False" to skip.')
 parser.add_argument("--wandb_project", default="care-training-large", type=str)
@@ -170,6 +178,76 @@ class EmotionClassifier(nn.Module):
 def zero_grad_hook(grad):
     """Zero gradients — used on common_params during opensmile_loss backward."""
     return torch.zeros_like(grad)
+
+
+# ---- Checkpointing ---------------------------------------------------------
+# Whole-module `torch.save(emo_model)` pickles ~650M params (~2.6 GB) per file
+# and hard-codes the class path into the pickle. These save state_dicts plus the
+# config needed to rebuild the model, and prune old periodic checkpoints.
+
+def _model_config(args):
+    """Everything `model_pase_hubert_large.load_pretrained` needs to rebuild."""
+    return {
+        "hubert_model_id": args.hubert_model_id,
+        "text_model_id":   args.text_model_id,
+        "num_layers":      args.num_layers,
+        "common_model":    args.common_model,
+        "use_conv":        args.use_conv,
+        "pool_fn":         args.pool_fn,
+        "keep_text_model": args.keep_text_model,
+    }
+
+
+def save_model(path, joint_model, args, num_updates, val_loss=None):
+    """Model-only checkpoint — this is what downstream feature extraction loads."""
+    torch.save({
+        "model":       joint_model.state_dict(),
+        "config":      _model_config(args),
+        "num_updates": num_updates,
+        "val_loss":    val_loss,
+    }, path)
+
+
+def save_resume(path, joint_model, common_opt, dual_opt, args, state):
+    """Rolling full-state checkpoint so a preempted run can continue.
+
+    Overwritten in place rather than versioned: optimizer state roughly doubles
+    the file, and only the newest one is ever useful.
+    """
+    tmp = path + ".tmp"
+    torch.save({
+        "model":            joint_model.state_dict(),
+        "common_optimizer": common_opt.state_dict(),
+        "dual_optimizer":   dual_opt.state_dict(),
+        "config":           _model_config(args),
+        "state":            state,
+        "rng": {
+            "torch":  torch.get_rng_state(),
+            "cuda":   torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy":  np.random.get_state(),
+            "python": random.getstate(),
+        },
+    }, tmp)
+    # Atomic-ish replace: a crash mid-write must not destroy the previous resume
+    # point, which is the whole reason the file exists.
+    os.replace(tmp, path)
+
+
+def prune_checkpoints(checkpoint_dir, keep_last):
+    """Delete all but the newest `keep_last` model-<update>.pth files."""
+    if keep_last <= 0:
+        return
+    ckpts = []
+    for fn in os.listdir(checkpoint_dir):
+        m = re.fullmatch(r"model-(\d+)\.pth", fn)
+        if m:
+            ckpts.append((int(m.group(1)), fn))
+    for _, fn in sorted(ckpts, reverse=True)[keep_last:]:
+        try:
+            os.remove(os.path.join(checkpoint_dir, fn))
+            logger.info(f"  pruned old checkpoint: {fn}")
+        except OSError as e:
+            logger.warning(f"  could not prune {fn}: {e}")
 
 
 def train(args):
@@ -285,7 +363,7 @@ def train(args):
     # Naming note: CARE's *code* names do not match the *paper's* encoder names.
     #   paper "common encoder"   == code `audio_model`   (first N HuBERT layers)
     #   paper "acoustic encoder" == code `dual_model`    (next N HuBERT layers)
-    #   paper "semantic encoder" == code `common_model`  (RoBERTa layers 6-11)
+    #   paper "semantic encoder" == code `common_model`  (last N RoBERTa layers)
     #                               + downblock/upblock conv adapters
     #
     # common_params: updated ONLY by distil_loss (semantic gradient)
@@ -338,6 +416,38 @@ def train(args):
     window_opensmile_loss = 0.0
     window_n = 0
     best_valid_loss = float("inf")
+    start_epoch = 0
+    resume_path = os.path.join(args.checkpoint_dir, "last.pth")
+
+    # ---- Resume ----
+    if args.resume:
+        path = resume_path if args.resume == "auto" else args.resume
+        if args.resume == "auto" and not os.path.exists(path):
+            logger.info("resume=auto but no last.pth found — starting fresh")
+        else:
+            logger.info(f"Resuming from {path}")
+            ckpt = torch.load(path, map_location=device, weights_only=False)
+            joint_model.load_state_dict(ckpt["model"])
+            common_optimizer.load_state_dict(ckpt["common_optimizer"])
+            dual_optimizer.load_state_dict(ckpt["dual_optimizer"])
+            st = ckpt["state"]
+            num_steps = st["num_steps"]
+            num_updates = st["num_updates"]
+            best_valid_loss = st["best_valid_loss"]
+            train_speechtext_loss = st["train_speechtext_loss"]
+            train_opensmile_loss = st["train_opensmile_loss"]
+            start_epoch = st["epoch"]
+            rng = ckpt.get("rng")
+            if rng:
+                torch.set_rng_state(rng["torch"].cpu())
+                if rng["cuda"] is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+                np.random.set_state(rng["numpy"])
+                random.setstate(rng["python"])
+            # The shuffled batch order within the interrupted epoch is not
+            # replayed, so a resumed run is not bit-identical to an unbroken one.
+            logger.info(f"  resumed at update {num_updates}/{UPDATES} "
+                        f"(epoch {start_epoch}, best val {best_valid_loss:.6f})")
 
     logger.info(f"PyTorch: {torch.__version__}   CUDA: {torch.version.cuda}")
     logger.info(f"CUDNN enabled={torch.backends.cudnn.enabled} deterministic={torch.backends.cudnn.deterministic}")
@@ -347,9 +457,11 @@ def train(args):
     logger.info(f"target: {UPDATES} optimizer updates @ effective batch "
                 f"{BATCH_SIZE*accum_steps}  (= {total_micro} micro-batches)  [paper Sec IV-D-1]")
     logger.info(f"lambda (acoustic loss weight): {args.alpha}")
+    logger.info(f"checkpoints: state_dict only, keep_last={args.keep_last} "
+                f"periodic + best.pth + final.pth, rolling last.pth for resume")
     logger.info("*" * 60)
 
-    for epoch in range(n_epochs + 1):
+    for epoch in range(start_epoch, n_epochs + 1):
         emo_model.train()
         for i, data in enumerate(train_loader):
             num_steps += 1
@@ -419,8 +531,9 @@ def train(args):
 
             # ---- Log + checkpoint every CKPT_EVERY updates ----
             if num_updates % CKPT_EVERY == 0:
-                torch.save(emo_model,
-                           os.path.join(args.checkpoint_dir, f"model-{num_updates}.pth"))
+                save_model(os.path.join(args.checkpoint_dir, f"model-{num_updates}.pth"),
+                           joint_model, args, num_updates)
+                prune_checkpoints(args.checkpoint_dir, args.keep_last)
                 logger.info("*" * 40)
                 logger.info(f"Update: {num_updates}/{UPDATES}   (micro-batches: {num_steps})")
                 logger.info(f"Speech Text Distillation Loss: {train_speechtext_loss/num_steps}")
@@ -463,22 +576,32 @@ def train(args):
                     if total_valid_loss < best_valid_loss:
                         # Paper Sec IV-D-1: "the best model parameters based on
                         # validation set performance are chosen for evaluation".
-                        torch.save(emo_model,
-                                   os.path.join(args.checkpoint_dir, f"model-{num_updates}.pth"))
-                        torch.save(emo_model,
-                                   os.path.join(args.checkpoint_dir, "best.pth"))
+                        best_valid_loss = total_valid_loss
+                        save_model(os.path.join(args.checkpoint_dir, "best.pth"),
+                                   joint_model, args, num_updates, val_loss=total_valid_loss)
                         logger.info("*" * 40)
                         logger.info(f"Update: {num_updates}   (NEW BEST)")
                         logger.info(f"Val Distillation Loss: {valid_speechtext_loss/valid_steps}")
                         logger.info(f"Val Opensmile Loss:    {valid_opensmile_loss/valid_steps}")
                         logger.info("*" * 40)
-                        best_valid_loss = total_valid_loss
+
+                # Rolling resume point, written after every eval.
+                save_resume(resume_path, joint_model, common_optimizer,
+                            dual_optimizer, args, {
+                                "num_steps":             num_steps,
+                                "num_updates":           num_updates,
+                                "epoch":                 epoch,
+                                "best_valid_loss":       best_valid_loss,
+                                "train_speechtext_loss": train_speechtext_loss,
+                                "train_opensmile_loss":  train_opensmile_loss,
+                            })
                 emo_model.train()
 
             if num_updates >= UPDATES:
                 logger.info(f"Reached {UPDATES} optimizer updates "
                             f"({num_steps} micro-batches). Saving final and stopping.")
-                torch.save(emo_model, os.path.join(args.checkpoint_dir, "final.pth"))
+                save_model(os.path.join(args.checkpoint_dir, "final.pth"),
+                           joint_model, args, num_updates)
                 if use_wandb:
                     wandb.finish()
                 return

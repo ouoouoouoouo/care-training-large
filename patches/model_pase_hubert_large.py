@@ -373,3 +373,47 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         fusion_out_aud_stack = torch.stack(out_layers_aud, dim=0) if return_layers else None
 
         return speech_only_feats_os, pooled_audio, fusion_out_stack, fusion_out_aud_stack
+
+
+# ---- Checkpoint loading ----------------------------------------------------
+def load_pretrained(checkpoint_path, device="cpu", eval_mode=True):
+    """Rebuild a trained SpeechTextModelHuBERTLarge from a trainer checkpoint.
+
+    The trainer saves state_dicts rather than pickled modules, so downstream
+    feature extraction goes through here instead of `torch.load(path)` directly:
+
+        from model_pase_hubert_large import load_pretrained
+        model = load_pretrained("ckpts_hubert_large/best.pth", device="cuda")
+        fusion_out, pooled_audio, fusion_out_aud = model.extract_audio_features(wavs)
+
+    Works on best.pth, final.pth, model-<update>.pth and last.pth alike — the
+    architecture config travels with the weights, so nothing has to be kept in
+    sync by hand on the downstream side.
+    """
+    from transformers import HubertModel, RobertaModel
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "model" not in ckpt or "config" not in ckpt:
+        raise ValueError(
+            f"{checkpoint_path} is not a trainer checkpoint (expected 'model' and "
+            f"'config' keys). Checkpoints written before the state_dict switch "
+            f"are pickled modules — load those with torch.load() directly."
+        )
+    cfg = ckpt["config"]
+
+    hubert = HubertModel.from_pretrained(cfg["hubert_model_id"])
+    roberta = RobertaModel.from_pretrained(cfg["text_model_id"])
+    model = SpeechTextModelHuBERTLarge(
+        hubert, roberta,
+        num_layers=cfg["num_layers"],
+        common_model=cfg["common_model"],
+        use_conv=cfg["use_conv"],
+        pool_fn=cfg["pool_fn"],
+        text_model_id=cfg["text_model_id"],
+        keep_text_model=cfg.get("keep_text_model", False),
+    )
+    model.load_state_dict(ckpt["model"])
+    model.to(device)
+    if eval_mode:
+        model.eval()
+    return model
