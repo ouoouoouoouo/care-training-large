@@ -1,0 +1,31 @@
+# PyTorch nightly with CUDA 12.8 — required for Blackwell (sm_120) support.
+# HuBERT-large + Llama-8B semantic mean-pool training requires the 102 GB
+# RTX PRO 6000 Blackwell GPU (peak VRAM ~85 GB).
+#
+# Install:
+#   conda create -n merits_llama_bw python=3.11 -y     # reuse merits_llama_bw
+#   conda activate merits_llama_bw
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+#   pip install -r requirements.txt
+
+# LLM (Llama for semantic target extraction) + PEFT (used indirectly)
+transformers==4.46.3
+peft==0.13.2
+accelerate==1.1.1
+bitsandbytes==0.44.1
+
+# HuBERT / audio loading
+soundfile
+librosa
+
+# Data / training utilities
+datasets>=2.20
+scikit-learn
+pandas
+tqdm
+pyyaml
+numpy
+
+# Experiment tracking
+wandb
+tensorboard

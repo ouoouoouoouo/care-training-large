@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ML artifacts
+outputs/
+data/
+ckpts/
+ckpts_*/
+*.pt
+*.pth
+*.tar
+*.pkl
+*.npy
+*.safetensors
+
+# Wandb
+wandb/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local test outputs
+logs/
+tmp/
