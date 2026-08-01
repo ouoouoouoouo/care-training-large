@@ -39,6 +39,12 @@ from transformers import HubertModel, RobertaModel
 from dataset_pase import SpeechTextDataset
 from model_pase_hubert_large import SpeechTextModelHuBERTLarge
 
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
 
 # ---- Logger ----------------------------------------------------------------
 logging.basicConfig(
@@ -77,6 +83,10 @@ parser.add_argument("--energy_weights",default="False", type=str)
 parser.add_argument("--pitch_weights", default="False", type=str)
 parser.add_argument("--supervised",    default="False", type=str)
 parser.add_argument("--hubert_model_id", default="facebook/hubert-large-ll60k", type=str)
+parser.add_argument("--wandb",         default="True", type=str,
+                    help='"True" to enable WandB; "False" to skip.')
+parser.add_argument("--wandb_project", default="care-training-large", type=str)
+parser.add_argument("--wandb_run_name",default=None, type=str)
 args = parser.parse_args()
 
 # ---- Hyperparams (paper-faithful) ------------------------------------------
@@ -117,6 +127,31 @@ def zero_grad_hook(grad):
 
 def train(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # ---- WandB (optional) ----
+    use_wandb = args.wandb.lower() == "true" and _HAS_WANDB
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"hubert-large-llama-b{args.batch_size}",
+            dir=args.checkpoint_dir,
+            config={
+                "hubert_model_id": args.hubert_model_id,
+                "common_model":    args.common_model,
+                "batch_size":      BATCH_SIZE,
+                "accum_steps":     accum_steps,
+                "effective_batch": BATCH_SIZE * accum_steps,
+                "learning_rate":   LEARNING_RATE,
+                "betas":           BETAS,
+                "weight_decay":    WEIGHT_DECAY,
+                "steps":           STEPS,
+                "num_layers":      args.num_layers,
+                "use_conv":        args.use_conv,
+                "use_pretrained":  args.use_pretrained,
+                "pool_fn":         args.pool_fn,
+            },
+        )
+        logger.info(f"WandB run: {wandb.run.url}")
 
     # ---- Data ----
     if args.supervised == "True":
@@ -240,6 +275,14 @@ def train(args):
                 common_optimizer.zero_grad()
                 dual_optimizer.zero_grad()
 
+            # ---- WandB: log train loss every 100 steps ----
+            if use_wandb and num_steps % 100 == 0:
+                wandb.log({
+                    "train/distil_loss":    train_speechtext_loss / num_steps,
+                    "train/opensmile_loss": train_opensmile_loss / num_steps,
+                    "train/total_loss":     (train_speechtext_loss + train_opensmile_loss) / num_steps,
+                }, step=num_steps)
+
             # ---- Log every 10K steps ----
             if num_steps % 10000 == 0:
                 torch.save(emo_model,
@@ -273,6 +316,16 @@ def train(args):
                         valid_opensmile_loss += o_loss.item()
 
                     total_valid_loss = (valid_speechtext_loss + valid_opensmile_loss) / max(1, valid_steps)
+
+                    # WandB: log val losses at every eval
+                    if use_wandb:
+                        wandb.log({
+                            "val/distil_loss":    valid_speechtext_loss / valid_steps,
+                            "val/opensmile_loss": valid_opensmile_loss / valid_steps,
+                            "val/total_loss":     total_valid_loss,
+                            "val/best_total_loss": min(total_valid_loss, best_valid_loss),
+                        }, step=num_steps)
+
                     if total_valid_loss < best_valid_loss:
                         torch.save(emo_model,
                                    os.path.join(args.checkpoint_dir, f"model-{num_steps}.pth"))
@@ -289,6 +342,8 @@ def train(args):
             if num_steps >= STEPS:
                 logger.info(f"Reached STEPS={STEPS}. Saving final and stopping.")
                 torch.save(emo_model, os.path.join(args.checkpoint_dir, "final.pth"))
+                if use_wandb:
+                    wandb.finish()
                 return
 
 
