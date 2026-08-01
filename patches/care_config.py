@@ -35,19 +35,21 @@ podcast_roberta_feats_all            = podcast_llama_feats
 podcast_roberta_feats_supervised     = podcast_llama_feats
 podcast_roberta_logits               = "/home/ouo/care_training_large/data/roberta_logits_PLACEHOLDER"
 
-# ---- WavLM tokens / features (dead code post-patch; kept for import compat) ----
-# dataset_pase.py imports these but the code path is skipped in the baseline
-# care-training patches. Values just need to exist so the `from config import ...`
-# succeeds; content is never actually loaded.
+# ---- WavLM tokens / features ----
+# dataset_pase.py OPENS these files at __init__ (not just imports the paths),
+# so they must actually exist on disk. Point wavlm_tokens_6 to the same real
+# wavlm_tokens.txt — the content is not used in our loss (only opensmile_loss
+# and distil_loss matter) but the file must be readable.
 podcast_wavlm_tokens    = "/home/ouo/care_training/data/wavlm_tokens.txt"
-podcast_wavlm_feats     = "/home/ouo/care_training/data/wavlm_features_PLACEHOLDER"
-podcast_wavlm_feats_6   = "/home/ouo/care_training/data/wavlm_features_6_PLACEHOLDER"
-podcast_wavlm_tokens_6  = "/home/ouo/care_training/data/wavlm_tokens_6_PLACEHOLDER"
+podcast_wavlm_tokens_6  = "/home/ouo/care_training/data/wavlm_tokens.txt"   # reuse same
+podcast_wavlm_feats     = "/home/ouo/care_training/data/pase_features"     # reuse pase dir
+podcast_wavlm_feats_6   = "/home/ouo/care_training/data/pase_features"     # reuse pase dir
 
 # ---- Quantized energy / pitch (dead code, --energy_weights/--pitch_weights False) ----
-quantized_energy_folder = "/home/ouo/care_training/data/energy_PLACEHOLDER"
-quantized_pitch_folder  = "/home/ouo/care_training/data/pitch_PLACEHOLDER"
+# Point to any existing directory so `os.listdir()` (if called) doesn't crash.
+quantized_energy_folder = "/home/ouo/care_training/data/pase_features"
+quantized_pitch_folder  = "/home/ouo/care_training/data/pase_features"
 
-# ---- Labels (dead in unsupervised mode; needed for --supervised True) ----
-podcast_labels          = "/home/ouo/care_training/data/labels_PLACEHOLDER"
-podcast_text_labels     = "/home/ouo/care_training/data/text_labels_PLACEHOLDER"
+# ---- Labels (dead in unsupervised mode; needed only for --supervised True) ----
+podcast_labels          = "/home/ouo/care_training/data/wavlm_tokens.txt"
+podcast_text_labels     = "/home/ouo/care_training/data/wavlm_tokens.txt"
