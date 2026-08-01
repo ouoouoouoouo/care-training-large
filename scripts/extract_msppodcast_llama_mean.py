@@ -39,33 +39,70 @@ def _mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tens
     return (summed / denom).float()
 
 
-def _load_transcripts(transcripts_dir: Path) -> Dict[str, str]:
-    """Load {utt_id: transcript} from all json files under transcripts_dir.
-    Adjust this loader to whatever format care-training already produced.
-    Expected: JSON files with {utt_id: "text"} or one JSON with the whole map.
+def _load_transcripts(transcripts_path: Path) -> Dict[str, str]:
+    """Load {utt_id: transcript} from either:
+      - a single CSV file (columns: utt_id, text)  — matches merits-l-text layout
+      - a directory of JSON files (dict {utt_id: text or {"text": ...}})
+      - a single JSON file with {utt_id: text or {"text": ...}}
     """
     out: Dict[str, str] = {}
-    json_files = sorted(transcripts_dir.glob("*.json"))
-    if not json_files:
-        raise FileNotFoundError(f"No .json under {transcripts_dir}")
 
-    for jf in json_files:
-        try:
-            data = json.loads(jf.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:  # noqa: BLE001
-            print(f"[warn] skip {jf.name}: {e}")
-            continue
-        if isinstance(data, dict):
-            # Two possible formats:
-            #   (a) {utt_id: "text"}  — merge directly
-            #   (b) {utt_id: {"text": "...", ...}} — pull "text" field
-            for uid, val in data.items():
-                if isinstance(val, str):
-                    out[uid] = val
-                elif isinstance(val, dict) and "text" in val:
-                    out[uid] = str(val["text"])
-    print(f"Loaded {len(out)} transcripts from {len(json_files)} files.")
-    return out
+    # CSV single file (merits-l-text layout)
+    if transcripts_path.is_file() and transcripts_path.suffix.lower() == ".csv":
+        import csv
+        with transcripts_path.open("r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                uid = row.get("utt_id")
+                text = row.get("text") or row.get("transcript")
+                if uid and text is not None:
+                    out[uid] = str(text)
+        print(f"Loaded {len(out)} transcripts from CSV: {transcripts_path.name}")
+        return out
+
+    # JSON single file
+    if transcripts_path.is_file() and transcripts_path.suffix.lower() == ".json":
+        data = json.loads(transcripts_path.read_text(encoding="utf-8"))
+        for uid, val in data.items():
+            if isinstance(val, str):
+                out[uid] = val
+            elif isinstance(val, dict) and "text" in val:
+                out[uid] = str(val["text"])
+        print(f"Loaded {len(out)} transcripts from JSON: {transcripts_path.name}")
+        return out
+
+    # Directory: try JSONs, then CSVs
+    if transcripts_path.is_dir():
+        json_files = sorted(transcripts_path.glob("*.json"))
+        csv_files = sorted(transcripts_path.glob("*.csv"))
+        for jf in json_files:
+            try:
+                data = json.loads(jf.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                for uid, val in data.items():
+                    if isinstance(val, str):
+                        out[uid] = val
+                    elif isinstance(val, dict) and "text" in val:
+                        out[uid] = str(val["text"])
+        for cf in csv_files:
+            import csv
+            with cf.open("r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    uid = row.get("utt_id")
+                    text = row.get("text") or row.get("transcript")
+                    if uid and text is not None and uid not in out:
+                        out[uid] = str(text)
+        if not out:
+            raise FileNotFoundError(
+                f"No JSON/CSV transcripts found under {transcripts_path}"
+            )
+        print(f"Loaded {len(out)} transcripts from {transcripts_path}")
+        return out
+
+    raise FileNotFoundError(
+        f"{transcripts_path} does not exist or is not a supported file/dir."
+    )
 
 
 def main() -> None:
