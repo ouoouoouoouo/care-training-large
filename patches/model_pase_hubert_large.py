@@ -242,6 +242,9 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         """
         out_layers, out_layers_aud = [], []
         if mode == "speech" or mode == "speech_text":
+            # Ensure (B, 1, T) — some callers pass (B, T) from the dataloader.
+            if audio.dim() == 2:
+                audio = audio.unsqueeze(1)
             audio_features = self.audio_feature_extractor(audio)
             audio_features = audio_features.permute(0, 2, 1)
             audio_features = self.feature_projection_audio(audio_features)[0]
