@@ -36,6 +36,10 @@ echo "  ✓ Installed model_pase_hubert_large.py"
 cp "$SCRIPT_DIR/train_pase_hubert_large.py" "$PRETRAIN_DIR/train_pase_hubert_large.py"
 echo "  ✓ Installed train_pase_hubert_large.py"
 
+# 4. Smoke test: shape/gradient check before committing to a 200K-step run
+cp "$SCRIPT_DIR/smoke_test_hubert_large.py" "$PRETRAIN_DIR/smoke_test_hubert_large.py"
+echo "  ✓ Installed smoke_test_hubert_large.py"
+
 echo ""
 echo "==== Verification ===="
 ls -lh "$PRETRAIN_DIR"/{config.py,model_pase.py,model_pase_hubert_large.py,train_pase.py,train_pase_hubert_large.py} 2>/dev/null || true

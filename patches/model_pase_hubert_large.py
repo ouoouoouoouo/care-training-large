@@ -13,9 +13,18 @@ Preserves CARE's key architectural ideas:
   - Semantic loss: MSE between projected audio pool and Llama mean-pool.
 
 Dimension adaptation (needed because HuBERT-large=1024 but RoBERTa=768):
-  - down_adapter (1024 -> 768) before common_model
-  - up_adapter   (768 -> 1024) after common_model
+  - audio_to_common (1024 -> 768) before common_model
+  - common_to_audio (768 -> 1024) after common_model
   - llama_semantic_proj (1024 -> 4096) on pooled_audio for Llama-aligned MSE
+
+WavLM -> HuBERT API differences handled here (these are NOT interchangeable):
+  - WavLM's feature_projection returns (hidden_states, extract_features);
+    HuBERT's returns hidden_states only.
+  - WavLM encoder layers take/return `position_bias` (gated relative position
+    bias); HuBERT encoder layers have neither.
+  - facebook/hubert-large-ll60k sets do_stable_layer_norm=True, so the encoder
+    is pre-LN and `encoder.layer_norm` belongs AFTER the layer stack, not
+    before it (WavLM-base is post-LN and applies it at the input).
 
 Args to __init__:
   hubert_model : HubertModel from `facebook/hubert-large-ll60k`
@@ -31,6 +40,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
+
+
+def _first(out):
+    """Encoder layers return either a tensor or a tuple depending on the
+    transformers version / model family. Normalise to a tensor."""
+    return out[0] if isinstance(out, (tuple, list)) else out
 
 
 # ---- Self-attention pooling (unchanged from CARE) --------------------------
@@ -84,6 +99,12 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         self.wavlm_layer_norm = hubert_model.encoder.layer_norm     # keep name for compat
         self.wavlm_dropout = nn.Dropout(0.1, inplace=False)
 
+        # hubert-large-ll60k -> True (pre-LN encoder, final LN after the stack)
+        # hubert-base-ls960  -> False (post-LN encoder, LN at the input)
+        self.do_stable_layer_norm = bool(
+            getattr(hubert_model.config, "do_stable_layer_norm", False)
+        )
+
         total_layers = len(hubert_model.encoder.layers)             # 24 for HuBERT-large
         self.audio_model = nn.ModuleList(
             [hubert_model.encoder.layers[i] for i in range(num_layers)]
@@ -93,7 +114,6 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         self.dual_model = nn.ModuleList(
             [hubert_model.encoder.layers[i] for i in range(num_layers, dual_end)]
         )
-        self.position_bias = None
 
         # PASE+ acoustic target projection: HuBERT 1024 -> PASE+ 256
         self.linear = nn.Linear(self.HUBERT_HIDDEN, self.PASE_DIM)
@@ -113,7 +133,7 @@ class SpeechTextModelHuBERTLarge(nn.Module):
             raise NotImplementedError(f"common_model={common_model!r} not supported")
 
         # ---- Dimension adapters between HuBERT (1024) and RoBERTa (768) ----
-        # CARE original had 1024==768 mismatch avoided because WavLM==RoBERTa==768.
+        # CARE original had no mismatch because WavLM==RoBERTa==768.
         # For HuBERT-large we need explicit down/up-projections at the boundary.
         self.audio_to_common = nn.Linear(self.HUBERT_HIDDEN, self.ROBERTA_HIDDEN)
         self.common_to_audio = nn.Linear(self.ROBERTA_HIDDEN, self.HUBERT_HIDDEN)
@@ -147,6 +167,59 @@ class SpeechTextModelHuBERTLarge(nn.Module):
             self.attenpool = SelfAttentionPooling(self.HUBERT_HIDDEN)
 
     # ------------------------------------------------------------------------
+    #  Shared HuBERT front-end (conv extractor -> feature projection -> pos conv)
+    # ------------------------------------------------------------------------
+    def _hubert_frontend(self, audio):
+        """(B, T_wav) or (B, 1, T_wav) -> (B, T, 1024), channels-last throughout."""
+        if audio.dim() == 2:
+            audio = audio.unsqueeze(1)
+        x = self.audio_feature_extractor(audio)      # (B, C_conv, T)
+        x = x.transpose(1, 2)                        # (B, T, C_conv)
+        # HuBERT's feature_projection returns a TENSOR (WavLM's returns a tuple).
+        x = self.feature_projection_audio(x)         # (B, T, 1024)
+        x = _first(x)
+        x = x + self.pos_conv(x)                     # pos_conv is channels-last in/out
+        if not self.do_stable_layer_norm:
+            # post-LN encoder (hubert-base): LN before the layer stack
+            x = self.wavlm_layer_norm(x)
+        x = self.wavlm_dropout(x)
+        return x
+
+    def _run_common(self, inp, out_layers=None, apply_conv=True, project_back=True):
+        """Semantic path: 1024 -> 768 -> common_model (+conv blocks) -> 1024.
+
+        `out_layers`, if given, collects the per-layer output already projected
+        back to 1024-d and length-matched to `inp`, so the caller can stack it.
+        """
+        x = self.audio_to_common(inp)                # 1024 -> 768
+        for i, layer in enumerate(self.common_model):
+            if self.use_conv == "True" and apply_conv:
+                x = x.permute(0, 2, 1)
+                x = self.downblock[i](x)
+                x = x.permute(0, 2, 1)
+            x = _first(layer(x))
+            if self.use_conv == "True" and apply_conv:
+                x = x.permute(0, 2, 1)
+                x = self.upblock[i](x)
+                x = x.permute(0, 2, 1)
+            # Length-match back to the audio path (conv round-trip is exact for
+            # T=249 but not for arbitrary T).
+            if x.shape[1] < inp.shape[1]:
+                pad = torch.zeros(x.shape[0], inp.shape[1] - x.shape[1], x.shape[-1],
+                                  dtype=x.dtype, device=x.device)
+                x = torch.cat((x, pad), dim=1)
+            elif x.shape[1] > inp.shape[1]:
+                x = x[:, :inp.shape[1], :]
+            if out_layers is not None:
+                out_layers.append(self.common_to_audio(x))
+        return self.common_to_audio(x) if project_back else x
+
+    def _pool(self, feats):
+        if self.pool_fn == "avg":
+            return torch.mean(feats, dim=1)
+        return self.attenpool(feats)
+
+    # ------------------------------------------------------------------------
     #  extract_audio_features — used by downstream feature extraction
     # ------------------------------------------------------------------------
     def extract_audio_features(self, audio):
@@ -155,161 +228,97 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         Same interface as CARE's SpeechTextModel.extract_audio_features, so
         merits-l-llama's downstream extractor can consume this drop-in.
         Shapes:
-            fusion_out     : (13, B, T, 1024)   semantic path all layers (audio 1024)
-            pooled_audio   : (B, 1024)           mean-pooled semantic output
+            fusion_out     : (13, B, T, 1024)   semantic path all layers
+            pooled_audio   : (B, 1024)          mean-pooled semantic output
             fusion_out_aud : (13, B, T, 1024)   acoustic path all layers
         """
-        out_layers, out_layers_aud = [], []
-        audio = audio.unsqueeze(1)
-        audio_features = self.audio_feature_extractor(audio)
-        audio_features = audio_features.permute(0, 2, 1)
-        audio_features = self.feature_projection_audio(audio_features)[0]
-        audio_features = audio_features.permute(0, 2, 1)
-        audio_features_conv = self.pos_conv(audio_features.transpose(1, 2))
-        audio_features_conv = audio_features_conv.transpose(1, 2)
-        audio_features = audio_features + audio_features_conv
-        audio_features = self.wavlm_layer_norm(audio_features.transpose(1, 2))
-        audio_features = self.wavlm_dropout(audio_features)
-        x = audio_features
+        x = self._hubert_frontend(audio)
+        out_layers, out_layers_aud = [x], [x]
+
         speech_feats = x
-        out_layers.append(speech_feats)
-        out_layers_aud.append(speech_feats)
-        position_bias = None
-        for i, layer in enumerate(self.audio_model):
-            if i != 0:
-                speech_feats, position_bias = layer(speech_feats, position_bias=position_bias)
-            else:
-                speech_feats, position_bias = layer(speech_feats)
+        for layer in self.audio_model:
+            speech_feats = _first(layer(speech_feats))
             out_layers.append(speech_feats)
             out_layers_aud.append(speech_feats)
         inp = speech_feats
 
         # Acoustic path
         speech_only_feats = speech_feats
-        for i, layer in enumerate(self.dual_model):
-            speech_only_feats, position_bias = layer(speech_only_feats, position_bias=position_bias)
+        for layer in self.dual_model:
+            speech_only_feats = _first(layer(speech_only_feats))
             out_layers_aud.append(speech_only_feats)
+        if self.do_stable_layer_norm:
+            # pre-LN encoder: final LN belongs at the end of the layer stack
+            speech_only_feats = self.wavlm_layer_norm(speech_only_feats)
+            out_layers_aud[-1] = speech_only_feats
         fusion_out_aud = torch.stack(out_layers_aud, dim=0)
 
         # Semantic path — with dim adaptation
-        if self.common_model_name == "roberta":
-            x_768 = self.audio_to_common(inp)           # 1024 -> 768
-            x = x_768
-            for i, layer in enumerate(self.common_model):
-                if self.use_conv == "True":
-                    x = x.permute(0, 2, 1)
-                    x = self.downblock[i](x)
-                    x = x.permute(0, 2, 1)
-                x = layer(x)[0]
-                if self.use_conv == "True":
-                    x = x.permute(0, 2, 1)
-                    x = self.upblock[i](x)
-                    x = x.permute(0, 2, 1)
-                if x.shape[1] < inp.shape[1]:
-                    x = torch.cat(
-                        (x, torch.zeros(x.shape[0], inp.shape[1] - x.shape[1], x.shape[-1]).to(x.device)),
-                        dim=1,
-                    )
-                else:
-                    x = x[:, :inp.shape[1], :]
-                # Bring back to HuBERT-large space (1024) for downstream consistency
-                x_1024 = self.common_to_audio(x)
-                out_layers.append(x_1024)
-            fusion_out = torch.stack(out_layers, dim=0)
-            fusion_feats_audio = x_1024
-        else:
-            raise NotImplementedError
+        fusion_feats_audio = self._run_common(inp, out_layers=out_layers)
+        fusion_out = torch.stack(out_layers, dim=0)
 
-        if self.pool_fn == "avg":
-            pooled_audio = torch.mean(fusion_feats_audio, 1).squeeze(1)
-        else:
-            pooled_audio = self.attenpool(fusion_feats_audio)
+        pooled_audio = self._pool(fusion_feats_audio)
         return fusion_out, pooled_audio, fusion_out_aud
 
     # ------------------------------------------------------------------------
     #  forward — training path, mirrors CARE's forward interface
     # ------------------------------------------------------------------------
-    def forward(self, audio, padding_mask=None, mask=False, mode="speech", weights=None):
+    def forward(self, audio, padding_mask=None, mask=False, mode="speech",
+                weights=None, return_layers=False):
         """Same output signature as CARE:
             speech_only_feats_os (B, T, 256)   PASE+ prediction
             pooled_audio         (B, 1024)     for llama_semantic_proj -> MSE
-            fusion_out           (13, B, T, 1024)
-            fusion_out_aud       (13, B, T, 1024)
+            fusion_out           (13, B, T, 1024) or None
+            fusion_out_aud       (13, B, T, 1024) or None
+
+        The stacked layer outputs are only built when `return_layers=True`;
+        the trainer discards them, and materialising two (13, B, T, 1024)
+        tensors inside the autograd graph costs ~0.8 GB at B=32, T=249.
 
         The trainer computes:
             opensmile_loss = MSE(speech_only_feats_os, pase_target)
             distil_loss    = MSE(llama_semantic_proj(pooled_audio), llama_target)
         """
-        out_layers, out_layers_aud = [], []
-        if mode == "speech" or mode == "speech_text":
-            # Ensure (B, 1, T) — some callers pass (B, T) from the dataloader.
-            if audio.dim() == 2:
-                audio = audio.unsqueeze(1)
-            audio_features = self.audio_feature_extractor(audio)
-            audio_features = audio_features.permute(0, 2, 1)
-            audio_features = self.feature_projection_audio(audio_features)[0]
-            audio_features = audio_features.permute(0, 2, 1)
-            audio_features_conv = self.pos_conv(audio_features.transpose(1, 2))
-            audio_features_conv = audio_features_conv.transpose(1, 2)
-            audio_features = audio_features + audio_features_conv
-            audio_features = self.wavlm_layer_norm(audio_features.transpose(1, 2))
-            audio_features = self.wavlm_dropout(audio_features)
-
-            x = audio_features
-            speech_feats = x
-            out_layers.append(speech_feats)
-            out_layers_aud.append(speech_feats)
-            position_bias = None
-            for i, layer in enumerate(self.audio_model):
-                if i != 0:
-                    speech_feats, position_bias = layer(speech_feats, position_bias=position_bias)
-                else:
-                    speech_feats, position_bias = layer(speech_feats)
-                out_layers.append(speech_feats)
-                out_layers_aud.append(speech_feats)
-            inp = speech_feats
-
-            # Acoustic path (dual_model + PASE+ head)
-            speech_only_feats = speech_feats
-            for i, layer in enumerate(self.dual_model):
-                speech_only_feats, position_bias = layer(speech_only_feats, position_bias=position_bias)
-                out_layers_aud.append(speech_only_feats)
-            speech_only_feats_os = self.linear(speech_only_feats)  # (B, T, 256)
-
-        # Semantic path (common_model, with dim adapters)
-        if self.common_model_name == "roberta":
-            x_768 = self.audio_to_common(inp)
-            x = x_768
-            for i, layer in enumerate(self.common_model):
-                if self.use_conv == "True" and mode == "speech":
-                    x = x.permute(0, 2, 1)
-                    x = self.downblock[i](x)
-                    x = x.permute(0, 2, 1)
-                x = layer(x)[0]
-                if self.use_conv == "True" and mode == "speech":
-                    x = x.permute(0, 2, 1)
-                    x = self.upblock[i](x)
-                    x = x.permute(0, 2, 1)
-                out_layers.append(x)  # (B, T_reduced_or_full, 768)
-            x_1024 = self.common_to_audio(x)   # back to HuBERT-large space
-            fusion_out = x_1024
-        else:
+        if mode not in ("speech", "speech_text"):
+            raise NotImplementedError(f"mode={mode!r} not supported")
+        if self.common_model_name != "roberta":
             raise NotImplementedError
 
-        if mode == "speech":
-            fusion_feats_audio = fusion_out
-            if self.pool_fn == "avg":
-                if weights is None:
-                    pooled_audio = torch.mean(fusion_feats_audio, 1).squeeze(1)
-                else:
-                    pooled_audio = torch.matmul(weights, fusion_feats_audio)
-            else:
-                pooled_audio = self.attenpool(fusion_feats_audio)
+        x = self._hubert_frontend(audio)
+        out_layers = [x] if return_layers else None
+        out_layers_aud = [x] if return_layers else None
 
-        # Note: out_layers currently has 768-d entries from common_model; if you
-        # want stacked layer outputs in HuBERT-large space, replace each with the
-        # 1024-projected version. Kept as-is for backward compat with CARE.
-        fusion_out_stack = torch.stack(out_layers, dim=0)
-        fusion_out_aud_stack = torch.stack(out_layers_aud, dim=0)
+        speech_feats = x
+        for layer in self.audio_model:
+            speech_feats = _first(layer(speech_feats))
+            if return_layers:
+                out_layers.append(speech_feats)
+                out_layers_aud.append(speech_feats)
+        inp = speech_feats
+
+        # Acoustic path (dual_model + PASE+ head)
+        speech_only_feats = speech_feats
+        for layer in self.dual_model:
+            speech_only_feats = _first(layer(speech_only_feats))
+            if return_layers:
+                out_layers_aud.append(speech_only_feats)
+        if self.do_stable_layer_norm:
+            speech_only_feats = self.wavlm_layer_norm(speech_only_feats)
+            if return_layers:
+                out_layers_aud[-1] = speech_only_feats
+        speech_only_feats_os = self.linear(speech_only_feats)  # (B, T, 256)
+
+        # Semantic path (common_model, with dim adapters)
+        fusion_out = self._run_common(
+            inp, out_layers=out_layers, apply_conv=(mode == "speech")
+        )
+
+        if weights is None:
+            pooled_audio = self._pool(fusion_out)
+        else:
+            pooled_audio = torch.matmul(weights, fusion_out)
+
+        fusion_out_stack = torch.stack(out_layers, dim=0) if return_layers else None
+        fusion_out_aud_stack = torch.stack(out_layers_aud, dim=0) if return_layers else None
 
         return speech_only_feats_os, pooled_audio, fusion_out_stack, fusion_out_aud_stack
