@@ -27,6 +27,7 @@ p.add_argument("--num_layers", type=int, default=12,
                help="Half the backbone depth, per paper Sec IV-A (12 for HuBERT-large).")
 p.add_argument("--use_conv", default="True")
 p.add_argument("--hubert_model_id", default="facebook/hubert-large-ll60k")
+p.add_argument("--text_model_id", default="roberta-large")
 p.add_argument("--return_layers", action="store_true",
                help="Also build/stack the per-layer outputs (extra memory).")
 args = p.parse_args()
@@ -44,13 +45,16 @@ hubert = HubertModel.from_pretrained(args.hubert_model_id)
 print(f"  hubert layers={len(hubert.encoder.layers)}  hidden={hubert.config.hidden_size}  "
       f"do_stable_layer_norm={hubert.config.do_stable_layer_norm}  "
       f"feat_extract_norm={hubert.config.feat_extract_norm}")
-roberta = RobertaModel.from_pretrained("roberta-base")
+roberta = RobertaModel.from_pretrained(args.text_model_id)
+print(f"  text  layers={roberta.config.num_hidden_layers}  hidden={roberta.config.hidden_size}")
 
 model = SpeechTextModelHuBERTLarge(
     hubert, roberta,
     num_layers=args.num_layers, common_model="roberta",
     use_conv=args.use_conv, pool_fn="avg",
+    text_model_id=args.text_model_id,
 ).to(device)
+print(f"  dim adapters: {'YES (not paper-faithful)' if model.has_dim_adapters else 'no (paper-faithful)'}")
 
 wavs = torch.randn(B, T_WAV, device=device)
 pase_target = torch.randn(B, T_PASE, PASE_DIM, device=device)
@@ -59,12 +63,15 @@ llama_target = torch.randn(B, LLAMA_DIM, device=device)
 speech_os, pooled_audio, fo, foa = model(wavs, return_layers=args.return_layers)
 pooled_llama = model.llama_semantic_proj(pooled_audio)
 
+H = model.HUBERT_HIDDEN
 print("\n--- forward shapes ---")
-print(f"  speech_only_feats_os : {tuple(speech_os.shape)}   expect (B, T, 256)")
-print(f"  pooled_audio         : {tuple(pooled_audio.shape)}   expect (B, 1024)")
-print(f"  pooled_audio_llama   : {tuple(pooled_llama.shape)}   expect (B, 4096)")
+print(f"  speech_only_feats_os : {tuple(speech_os.shape)}   expect ({B}, {T_PASE}, {PASE_DIM})")
+print(f"  pooled_audio         : {tuple(pooled_audio.shape)}   expect ({B}, {H})")
+print(f"  pooled_audio_llama   : {tuple(pooled_llama.shape)}   expect ({B}, {LLAMA_DIM})")
 print(f"  fusion_out           : {tuple(fo.shape) if fo is not None else None}")
 print(f"  fusion_out_aud       : {tuple(foa.shape) if foa is not None else None}")
+print(f"  downstream layer stack: {1 + 2*args.num_layers} layers x T x {2*H} "
+      f"(concat semantic+acoustic); paper's WavLM-base config is 13 x T x 1536")
 
 assert pooled_audio.shape == (B, model.HUBERT_HIDDEN), pooled_audio.shape
 assert pooled_llama.shape == (B, LLAMA_DIM), pooled_llama.shape
@@ -86,19 +93,27 @@ opensmile = nn.MSELoss()(speech_os, pase_target)
 distil.backward(retain_graph=True)
 opensmile.backward()
 
+def _has_grad(module):
+    ps = list(module.parameters())
+    return bool(ps) and any(p.grad is not None and p.grad.abs().sum() > 0 for p in ps)
+
+
 grad_ok = {
-    "audio_model":         any(p.grad is not None and p.grad.abs().sum() > 0
-                               for p in model.audio_model.parameters()),
-    "dual_model":          any(p.grad is not None and p.grad.abs().sum() > 0
-                               for p in model.dual_model.parameters()),
-    "common_model":        any(p.grad is not None and p.grad.abs().sum() > 0
-                               for p in model.common_model.parameters()),
-    "audio_to_common":     model.audio_to_common.weight.grad is not None,
-    "common_to_audio":     model.common_to_audio.weight.grad is not None,
-    "llama_semantic_proj": model.llama_semantic_proj[0].weight.grad is not None,
-    "linear (PASE head)":  model.linear.weight.grad is not None,
+    "audio_model (common enc.)":   _has_grad(model.audio_model),
+    "dual_model (acoustic enc.)":  _has_grad(model.dual_model),
+    "common_model (semantic enc.)": _has_grad(model.common_model),
+    "llama_semantic_proj":         _has_grad(model.llama_semantic_proj),
+    "linear (PASE head)":          _has_grad(model.linear),
 }
+if args.use_conv == "True":
+    grad_ok["downblock"] = _has_grad(model.downblock)
+    grad_ok["upblock"] = _has_grad(model.upblock)
+if model.has_dim_adapters:
+    grad_ok["audio_to_common"] = _has_grad(model.audio_to_common)
+    grad_ok["common_to_audio"] = _has_grad(model.common_to_audio)
 print("\n--- backward: gradients reach ---")
+print("  (graph connectivity only — the trainer additionally freezes")
+print("   common_model per paper Fig. 2)")
 for k, v in grad_ok.items():
     print(f"  {'OK ' if v else 'NO '} {k}")
 

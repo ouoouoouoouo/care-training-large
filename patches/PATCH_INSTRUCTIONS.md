@@ -70,12 +70,28 @@ changes, not the optimization.
 | best model by validation | Sec IV-D-1 | `best.pth` on val loss, every 5K updates |
 | λ = 1 for L_sem + λ·L_acoust | Sec IV-D-1, Eq. 3 | `--alpha 1.0` applied to the acoustic loss |
 | common enc. = first half, acoustic enc. = last half of backbone | Sec IV-A | `--num_layers` defaults to `total_layers // 2` (12 for HuBERT-large) |
-| semantic enc. = last 6 RoBERTa-base layers | Sec IV-A | `common_model = roberta.encoder.layer[6:12]` |
+| semantic enc. = **last** N layers of the text model | Sec IV-A | `roberta.encoder.layer[-num_layers:]` → `[12:24]` of roberta-large |
 | **semantic enc. transformer layers frozen**, conv adapters trained | Fig. 2, Sec III, Table V (CARE-FT) | `common_model` in neither optimizer group |
-| conv adapter: kernel 5, ×3 down before / ×3 up after each layer, 768 ch | Sec III | `downblock` / `upblock`, `range(6)` |
+| conv adapter: kernel 5, ×3 down before / ×3 up after **each** layer, channels = text width | Sec III | `downblock` / `upblock`, `range(num_layers)`, 1024 ch |
+| no dim adapters at the speech/text boundary (WavLM-base 768 == RoBERTa-base 768) | Sec III, Fig. 2 | roberta-large is 1024 == HuBERT-large 1024 → `nn.Identity()` |
 | PASE+ 256-d @ 50 Hz, 5 s crops | Sec III, IV-D-1 | 249 frames, `opensmile_feats[:, :249, :]` |
 
 **Intentional deviations** (this project's contribution):
 - semantic target `y_text` = Llama-3.1-8B mean-pool (4096-d), not RoBERTa-base
-  mean-pool (768-d)
+  mean-pool (768-d), via `llama_semantic_proj` (1024 → 2048 → 4096)
 - backbone = HuBERT-large (24 layers, 1024-d), not WavLM-base (12 layers, 768-d)
+- semantic encoder = RoBERTa-large, chosen so the width match (and therefore
+  the adapter-free boundary) survives the backbone swap
+
+## Downstream layer stack changed — update the SUPERB config
+
+The paper aggregates **13 layers × T × 1536**: 6 pairs of (semantic ‖ acoustic)
+concatenated to 1536, plus the conv extractor output and the common encoder's 6
+layers duplicated 768→1536.
+
+Scaling the backbone rescales this. At `--num_layers 12` with HuBERT-large +
+RoBERTa-large it becomes **25 layers × T × 2048**: 12 concatenated pairs, plus
+1 conv output + 12 common-encoder layers duplicated 1024→2048. The convex
+combination in the downstream head must be resized from 13 to 25 weights and
+its input from 1536 to 2048, or feature extraction will silently mis-slice.
+Both the trainer and the smoke test print the expected stack size at startup.

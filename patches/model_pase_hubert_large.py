@@ -1,7 +1,8 @@
 """HuBERT-large + Llama-aligned CARE model.
 
 Extends CARE's SpeechTextModel (WavLM-base + RoBERTa semantic) to:
-  1. HuBERT-large backbone (24 layers, 1024-d) instead of WavLM-base (12 layers, 768-d).
+  1. HuBERT-large backbone (24 layers, 1024-d) instead of WavLM-base (12 layers,
+     768-d), with RoBERTa-large as the matching 1024-d semantic encoder.
   2. Semantic supervision target = Llama-3.1-8B mean-pool (4096-d) instead of
      RoBERTa-base mean-pool (768-d).
 
@@ -12,10 +13,19 @@ Preserves CARE's key architectural ideas:
     "opensmile_loss" in CARE code for legacy reasons).
   - Semantic loss: MSE between projected audio pool and Llama mean-pool.
 
-Dimension adaptation (needed because HuBERT-large=1024 but RoBERTa=768):
-  - audio_to_common (1024 -> 768) before common_model
-  - common_to_audio (768 -> 1024) after common_model
+Dimension handling:
+  CARE has no dimension adapters at all — WavLM-base and RoBERTa-base are both
+  768-d, so the semantic encoder consumes speech representations directly.
+  Pairing HuBERT-large (1024) with RoBERTa-base (768) would force two extra
+  Linear layers that the paper does not have, so the default text model here is
+  roberta-large (1024), which restores the paper's adapter-free boundary.
+  `audio_to_common` / `common_to_audio` collapse to nn.Identity whenever the two
+  hidden sizes match, and only materialise as real projections if you
+  deliberately mix a 1024-d backbone with a 768-d text model.
+
   - llama_semantic_proj (1024 -> 4096) on pooled_audio for Llama-aligned MSE
+    (this one IS a deviation: the paper regresses 768-d RoBERTa mean-pool
+    directly, we regress 4096-d Llama mean-pool)
 
 WavLM -> HuBERT API differences handled here (these are NOT interchangeable):
   - WavLM's feature_projection returns (hidden_states, extract_features);
@@ -28,10 +38,15 @@ WavLM -> HuBERT API differences handled here (these are NOT interchangeable):
 
 Args to __init__:
   hubert_model : HubertModel from `facebook/hubert-large-ll60k`
-  roberta_model: RobertaModel from `roberta-base` (still used for common_model)
-  num_layers   : 6 by default (audio=layers[0:6], dual=layers[6:12]).
-                 Set to 12 to use all 24 HuBERT-large layers
-                 (audio=layers[0:12], dual=layers[12:24]).
+  roberta_model: RobertaModel from `roberta-large` (semantic encoder)
+  num_layers   : layers per encoder. Paper Sec IV-A splits the backbone in half
+                 (common encoder = first N, acoustic encoder = last N), and the
+                 semantic encoder takes the LAST N layers of the text model.
+                 12 for HuBERT-large + RoBERTa-large:
+                   common   = hubert.layers[0:12]
+                   acoustic = hubert.layers[12:24]
+                   semantic = roberta.layer[12:24]
+                 6 reproduces the paper's WavLM-base + RoBERTa-base geometry.
 """
 from __future__ import annotations
 
@@ -69,8 +84,6 @@ class SpeechTextModelHuBERTLarge(nn.Module):
     can reuse the CARE training loop with minimal modifications.
     """
 
-    HUBERT_HIDDEN = 1024   # HuBERT-large hidden size
-    ROBERTA_HIDDEN = 768   # RoBERTa-base (used by common_model)
     LLAMA_HIDDEN = 4096    # Llama-3.1-8B (semantic supervision target)
     PASE_DIM = 256         # PASE+ acoustic target dim
 
@@ -78,16 +91,24 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         self,
         hubert_model,
         roberta_model,
-        num_layers: int = 6,
+        num_layers: int = 12,
         common_model: str = "roberta",
         use_conv: str = "True",
         pool_fn: str = "avg",
         semantic_proj_hidden: int = 2048,   # bottleneck between 1024 -> 4096
+        text_model_id: str = "roberta-large",
+        keep_text_model: bool = False,
     ) -> None:
         super().__init__()
         self.common_model_name = common_model
         self.num_layers = num_layers
         self.use_conv = use_conv
+
+        # Hidden sizes are read from the checkpoints rather than hard-coded, so
+        # base/large can be mixed on either side without silent shape errors.
+        self.HUBERT_HIDDEN = hubert_model.config.hidden_size      # 1024 for large
+        self.TEXT_HIDDEN = roberta_model.config.hidden_size       # 1024 for large
+        self.ROBERTA_HIDDEN = self.TEXT_HIDDEN                    # backwards-compat alias
 
         # ---- HuBERT-large backbone (audio_model + dual_model) --------------
         # HuBERT's feature_extractor is Wav2Vec2 CNN — same interface as WavLM.
@@ -118,39 +139,61 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         # PASE+ acoustic target projection: HuBERT 1024 -> PASE+ 256
         self.linear = nn.Linear(self.HUBERT_HIDDEN, self.PASE_DIM)
 
-        # ---- RoBERTa common_model (semantic path, still 768-d) --------------
-        self.roberta_embeddings = roberta_model.embeddings
-        self.text_model = nn.ModuleList(
-            [roberta_model.encoder.layer[i] for i in range(num_layers)]
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained("roberta-base")
-
-        if common_model == "roberta":
-            self.common_model = nn.ModuleList(
-                [roberta_model.encoder.layer[i] for i in range(6, 12)]
-            )
-        else:
+        # ---- Semantic encoder (paper) == `common_model` (CARE code naming) ---
+        # Paper Sec IV-A: "initialized with the weights of the last 6 layers of
+        # a pre-trained RoBERTa base model" -> generally, the LAST num_layers
+        # layers of whichever text model is used.
+        if common_model != "roberta":
             raise NotImplementedError(f"common_model={common_model!r} not supported")
 
-        # ---- Dimension adapters between HuBERT (1024) and RoBERTa (768) ----
-        # CARE original had no mismatch because WavLM==RoBERTa==768.
-        # For HuBERT-large we need explicit down/up-projections at the boundary.
-        self.audio_to_common = nn.Linear(self.HUBERT_HIDDEN, self.ROBERTA_HIDDEN)
-        self.common_to_audio = nn.Linear(self.ROBERTA_HIDDEN, self.HUBERT_HIDDEN)
+        text_layers = roberta_model.encoder.layer
+        if num_layers > len(text_layers):
+            raise ValueError(
+                f"num_layers={num_layers} exceeds the text model's "
+                f"{len(text_layers)} layers ({text_model_id}); the semantic "
+                f"encoder takes the last num_layers layers."
+            )
+        start = len(text_layers) - num_layers
+        self.common_model = nn.ModuleList(
+            [text_layers[i] for i in range(start, len(text_layers))]
+        )
 
-        # CARE's per-layer down/upblocks (kept if use_conv=True), adapted for 768-d.
+        self.roberta_embeddings = roberta_model.embeddings
+        self.tokenizer = AutoTokenizer.from_pretrained(text_model_id)
+        # CARE keeps a text-side tower for its speech_text mode; this trainer
+        # never runs it, and at roberta-large it is ~150M frozen parameters
+        # pickled into every torch.save(emo_model) checkpoint.
+        self.text_model = nn.ModuleList(
+            [text_layers[i] for i in range(num_layers)]
+        ) if keep_text_model else None
+
+        # ---- Dimension adapters (absent from CARE, hence Identity by default)
+        # CARE has none: WavLM-base and RoBERTa-base are both 768. With
+        # HuBERT-large + RoBERTa-large both sides are 1024, so the boundary
+        # stays adapter-free. Real projections appear only for a mixed pairing.
+        if self.HUBERT_HIDDEN == self.TEXT_HIDDEN:
+            self.audio_to_common = nn.Identity()
+            self.common_to_audio = nn.Identity()
+        else:
+            self.audio_to_common = nn.Linear(self.HUBERT_HIDDEN, self.TEXT_HIDDEN)
+            self.common_to_audio = nn.Linear(self.TEXT_HIDDEN, self.HUBERT_HIDDEN)
+        self.has_dim_adapters = self.HUBERT_HIDDEN != self.TEXT_HIDDEN
+
+        # ---- Conv adapters (paper Sec III): one 1D-conv block before and one
+        # after EACH semantic-encoder transformer layer. Kernel 5, /3 downsample
+        # before and x3 upsample after, channels matched to the text model.
         if use_conv == "True":
             self.downblock = nn.ModuleList([
-                nn.Conv1d(in_channels=self.ROBERTA_HIDDEN,
-                          out_channels=self.ROBERTA_HIDDEN,
+                nn.Conv1d(in_channels=self.TEXT_HIDDEN,
+                          out_channels=self.TEXT_HIDDEN,
                           kernel_size=5, stride=3)
-                for _ in range(6)
+                for _ in range(num_layers)
             ])
             self.upblock = nn.ModuleList([
-                nn.ConvTranspose1d(in_channels=self.ROBERTA_HIDDEN,
-                                   out_channels=self.ROBERTA_HIDDEN,
+                nn.ConvTranspose1d(in_channels=self.TEXT_HIDDEN,
+                                   out_channels=self.TEXT_HIDDEN,
                                    kernel_size=5, stride=3, output_padding=1)
-                for _ in range(6)
+                for _ in range(num_layers)
             ])
 
         # ---- Semantic supervision projector: HuBERT space -> Llama space ----
@@ -186,12 +229,16 @@ class SpeechTextModelHuBERTLarge(nn.Module):
         return x
 
     def _run_common(self, inp, out_layers=None, apply_conv=True, project_back=True):
-        """Semantic path: 1024 -> 768 -> common_model (+conv blocks) -> 1024.
+        """Semantic encoder: conv-adapted pass through the frozen text layers.
+
+        Dimensions are HUBERT_HIDDEN -> TEXT_HIDDEN -> HUBERT_HIDDEN; both
+        adapters are Identity when the two match (the paper's configuration).
 
         `out_layers`, if given, collects the per-layer output already projected
-        back to 1024-d and length-matched to `inp`, so the caller can stack it.
+        back to HUBERT_HIDDEN and length-matched to `inp`, so the caller can
+        stack it.
         """
-        x = self.audio_to_common(inp)                # 1024 -> 768
+        x = self.audio_to_common(inp)
         for i, layer in enumerate(self.common_model):
             if self.use_conv == "True" and apply_conv:
                 x = x.permute(0, 2, 1)
@@ -227,10 +274,14 @@ class SpeechTextModelHuBERTLarge(nn.Module):
 
         Same interface as CARE's SpeechTextModel.extract_audio_features, so
         merits-l-llama's downstream extractor can consume this drop-in.
-        Shapes:
-            fusion_out     : (13, B, T, 1024)   semantic path all layers
-            pooled_audio   : (B, 1024)          mean-pooled semantic output
-            fusion_out_aud : (13, B, T, 1024)   acoustic path all layers
+        Shapes, with L = num_layers and H = HUBERT_HIDDEN:
+            fusion_out     : (1 + 2L, B, T, H)  conv out + common + semantic
+            pooled_audio   : (B, H)             mean-pooled semantic output
+            fusion_out_aud : (1 + 2L, B, T, H)  conv out + common + acoustic
+
+        For the paper's L=6, H=768 this is the familiar (13, B, T, 768). For
+        HuBERT-large + RoBERTa-large at L=12, H=1024 it is (25, B, T, 1024) —
+        the downstream SUPERB-style convex combination must be sized to match.
         """
         x = self._hubert_frontend(audio)
         out_layers, out_layers_aud = [x], [x]

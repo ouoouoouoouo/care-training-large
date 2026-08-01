@@ -2,7 +2,8 @@
 
 Extends CARE's train_pase.py to:
   1. Load HuBERT-large (facebook/hubert-large-ll60k) instead of WavLM-base.
-  2. Use SpeechTextModelHuBERTLarge with dim adapters (1024<->768) and a
+  2. Use SpeechTextModelHuBERTLarge with a RoBERTa-large semantic encoder
+     (1024-d, so the speech/text boundary stays adapter-free as in CARE) and a
      new semantic projector (1024 -> 4096) for Llama-aligned MSE.
   3. Load Llama-3.1-8B mean-pool features (4096-d) as the semantic target,
      produced by scripts/extract_msppodcast_llama_mean.py in this repo.
@@ -104,6 +105,16 @@ parser.add_argument("--energy_weights",default="False", type=str)
 parser.add_argument("--pitch_weights", default="False", type=str)
 parser.add_argument("--supervised",    default="False", type=str)
 parser.add_argument("--hubert_model_id", default="facebook/hubert-large-ll60k", type=str)
+parser.add_argument("--text_model_id",  default="roberta-large", type=str,
+                    help="Semantic encoder init. roberta-large (1024-d) matches "
+                         "HuBERT-large's width, keeping the speech/text boundary "
+                         "adapter-free as in the paper (WavLM-base 768 == "
+                         "RoBERTa-base 768). Use roberta-base only if you also "
+                         "drop to a 768-d backbone.")
+parser.add_argument("--keep_text_model", action="store_true",
+                    help="Keep CARE's unused text-side tower. Off by default: "
+                         "this trainer never runs it and it adds ~150M frozen "
+                         "params to every pickled checkpoint.")
 parser.add_argument("--wandb",         default="True", type=str,
                     help='"True" to enable WandB; "False" to skip.')
 parser.add_argument("--wandb_project", default="care-training-large", type=str)
@@ -141,13 +152,12 @@ accum_steps = args.effective_batch // args.batch_size
 class EmotionClassifier(nn.Module):
     """CARE-style wrapper. Adds the semantic projector output for Llama MSE."""
 
-    def __init__(self, joint_model, output_dim):
+    def __init__(self, joint_model):
         super().__init__()
         self.joint_model = joint_model
-        # Kept for interface parity with CARE (unused in this trainer).
-        self.fc_text = nn.Linear(768 * 2, 768)
-        self.act = nn.ReLU()
-        self.fc_text_final = nn.Linear(768, output_dim)
+        # CARE's classification head is dropped: pre-training uses only the two
+        # regression losses, and its hard-coded 768 dims are wrong for a
+        # 1024-d backbone anyway.
 
     def forward(self, audio):
         speech_feats, pooled_audio, _, _ = self.joint_model(audio)
@@ -174,6 +184,7 @@ def train(args):
             dir=args.checkpoint_dir,
             config={
                 "hubert_model_id": args.hubert_model_id,
+                "text_model_id":   args.text_model_id,
                 "common_model":    args.common_model,
                 "batch_size":      BATCH_SIZE,
                 "accum_steps":     accum_steps,
@@ -232,14 +243,22 @@ def train(args):
             f"({total_layers//2} + {total_layers//2})."
         )
     logger.info(f"num_layers: {args.num_layers}  "
-                f"(common encoder = layers 0-{args.num_layers-1}, "
-                f"acoustic encoder = layers {args.num_layers}-{args.num_layers*2-1})")
+                f"(common encoder = hubert[0:{args.num_layers}], "
+                f"acoustic encoder = hubert[{args.num_layers}:{args.num_layers*2}])")
+    logger.info(f"downstream layer stack: {1 + 2*args.num_layers} layers "
+                f"(1 conv + {args.num_layers} common + {args.num_layers} "
+                f"semantic/acoustic) — size the SUPERB convex combination to match")
     if use_wandb:
         # num_layers was resolved after wandb.init(), so backfill the real value.
         wandb.config.update({"num_layers": args.num_layers,
-                             "backbone_layers": total_layers}, allow_val_change=True)
+                             "backbone_layers": total_layers,
+                             "downstream_layers": 1 + 2 * args.num_layers},
+                            allow_val_change=True)
 
-    roberta_model = RobertaModel.from_pretrained("roberta-base")
+    roberta_model = RobertaModel.from_pretrained(args.text_model_id)
+    logger.info(f"Text model: {args.text_model_id}  "
+                f"layers={roberta_model.config.num_hidden_layers}  "
+                f"hidden={roberta_model.config.hidden_size}")
 
     joint_model = SpeechTextModelHuBERTLarge(
         hubert_model, roberta_model,
@@ -247,8 +266,20 @@ def train(args):
         common_model=args.common_model,
         use_conv=args.use_conv,
         pool_fn=args.pool_fn,
+        text_model_id=args.text_model_id,
+        keep_text_model=args.keep_text_model,
     )
-    emo_model = EmotionClassifier(joint_model, output_dim=3).to(device)
+    if joint_model.has_dim_adapters:
+        logger.warning(
+            f"Backbone is {joint_model.HUBERT_HIDDEN}-d but the text model is "
+            f"{joint_model.TEXT_HIDDEN}-d, so two Linear dim adapters were added "
+            f"at the speech/text boundary. CARE has none (WavLM-base 768 == "
+            f"RoBERTa-base 768); pair widths to stay faithful."
+        )
+    else:
+        logger.info(f"Speech/text boundary is adapter-free at "
+                    f"{joint_model.HUBERT_HIDDEN}-d (matches paper design)")
+    emo_model = EmotionClassifier(joint_model).to(device)
 
     # ---- Parameter grouping (paper-faithful zero_grad_hook design) ----
     # Naming note: CARE's *code* names do not match the *paper's* encoder names.
@@ -266,7 +297,8 @@ def train(args):
     # layers are frozen while the convolutional adapters are trained" — and
     # Sec III — "the transformer layers themselves are not updated during
     # training". Table V's CARE-FT ablation shows updating them hurts. Only the
-    # conv adapters (downblock/upblock) and the 1024<->768 dim adapters train.
+    # conv adapters (downblock/upblock) train, plus the dim adapters if a
+    # mismatched width pairing forced them into existence.
     dual_params, common_params = [], []
     for name, param in emo_model.named_parameters():
         # Common (conv adapters + dim adapters + semantic projector + audio_model)
