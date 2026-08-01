@@ -8,12 +8,12 @@ codebase leaves unused / dead after patching). Only the semantic target
 everything else matches the care-training baseline paths.
 """
 
-# ---- MSP-PODCAST audio + splits (unchanged from care-training baseline) ----
+# ---- MSP-PODCAST audio + splits (from care-training baseline) ----
 podcast_audio_folder = "/home/ouo/dataset/MSP_Podcast/Audios"
-train_files          = "/home/ouo/care_training/data/train_files.json"
-valid_files          = "/home/ouo/care_training/data/valid_files.json"
+train_files          = "/home/ouo/care_training/data/trainlist.pkl"
+valid_files          = "/home/ouo/care_training/data/vallist.pkl"
 
-# ---- Whisper transcripts (unchanged) ----
+# ---- Whisper transcripts ----
 podcast_transcripts  = "/home/ouo/care_training/data/whisper_transcripts.json"
 
 # ---- Acoustic supervision target: PASE+ 256-d @ 100Hz (unchanged) ----
@@ -51,5 +51,5 @@ quantized_energy_folder = "/home/ouo/care_training/data/pase_features"
 quantized_pitch_folder  = "/home/ouo/care_training/data/pase_features"
 
 # ---- Labels (dead in unsupervised mode; needed only for --supervised True) ----
-podcast_labels          = "/home/ouo/care_training/data/wavlm_tokens.txt"
-podcast_text_labels     = "/home/ouo/care_training/data/wavlm_tokens.txt"
+podcast_labels          = "/home/ouo/care_training/data/text_labels.json"
+podcast_text_labels     = "/home/ouo/care_training/data/text_labels.json"
